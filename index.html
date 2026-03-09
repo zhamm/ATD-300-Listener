@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATD-300 Live Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Consolas, monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+        h1 { margin-bottom: 4px; font-size: 1.3rem; color: #569cd6; }
+        .subtitle { color: #666; margin-bottom: 16px; font-size: 0.85rem; }
+
+        .status-bar { display: flex; gap: 16px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+        .dot-green { background: #4caf50; }
+        .dot-red { background: #f44747; }
+        .dot-yellow { background: #ffb74d; }
+        button { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-family: inherit; font-weight: bold; }
+        #connectBtn { background: #388e3c; color: #fff; }
+        #connectBtn.connected { background: #c62828; }
+        .btn-sm { background: #555; color: #fff; font-size: 0.8rem; padding: 4px 10px; }
+        .cfg-input { background: #1e1e1e; border: 1px solid #555; color: #d4d4d4; padding: 4px 8px; border-radius: 4px; font-family: inherit; font-size: 0.85rem; }
+        .cfg-input:focus { border-color: #569cd6; outline: none; }
+        #hostInput { width: 150px; }
+        #portInput { width: 60px; }
+        .cfg-label { color: #888; font-size: 0.8rem; }
+
+        .top-panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+        .panel { background: #252526; border: 1px solid #333; border-radius: 6px; padding: 14px; }
+        .panel h2 { font-size: 0.95rem; color: #dcdcaa; margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+        .panel h2 .badge { background: #c62828; color: #fff; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
+        .kv { display: flex; justify-content: space-between; padding: 3px 0; font-size: 0.85rem; }
+        .kv .label { color: #9cdcfe; }
+        .kv .value { color: #ce9178; font-weight: bold; }
+        .big-value { font-size: 2rem; color: #4ec9b0; font-weight: bold; text-align: center; padding: 10px 0; }
+        .big-label { text-align: center; color: #888; font-size: 0.8rem; }
+
+        /* Threat events table */
+        .threat-panel { margin-bottom: 16px; }
+        .threat-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+        .threat-table th { text-align: left; color: #9cdcfe; padding: 6px 8px; border-bottom: 2px solid #444; font-weight: normal; }
+        .threat-table td { padding: 5px 8px; border-bottom: 1px solid #2a2a2a; }
+        .threat-table tbody tr { transition: background 0.2s; }
+        .threat-table tbody tr:hover { background: #2a2d2e; }
+        .threat-table tbody tr.new-row { animation: flashRow 2s ease-out; }
+        @keyframes flashRow { 0% { background: #5c2020; } 100% { background: transparent; } }
+        .threat-type { font-weight: bold; text-transform: uppercase; }
+        .threat-type.gun { color: #f44747; }
+        .threat-type.firecracker { color: #ffb74d; }
+        .threat-type.sniper { color: #ff5252; }
+        .threat-type.other { color: #ce9178; }
+        .threat-scroll { max-height: 220px; overflow-y: auto; }
+        .no-threats { color: #555; text-align: center; padding: 20px; font-style: italic; }
+
+        /* Event log */
+        #log { background: #111; border: 1px solid #333; border-radius: 4px; padding: 12px; height: 200px; overflow-y: auto; font-size: 0.8rem; line-height: 1.5; }
+        .log-entry { margin-bottom: 2px; }
+        .log-measure { color: #6a9955; }
+        .log-soh { color: #9cdcfe; }
+        .log-threat { color: #f44747; font-weight: bold; }
+        .log-info { color: #888; }
+        .log-time { color: #555; margin-right: 8px; }
+
+        @media (max-width: 700px) { .top-panels { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <h1>ATD-300 Live Dashboard</h1>
+    <p class="subtitle">Receives real-time data from Acoem ATD-300 gunshot sensors &mdash; stored in SQLite</p>
+
+    <div class="status-bar">
+        <span class="cfg-label">Server:</span>
+        <input type="text" id="hostInput" class="cfg-input" value="192.168.1.16" placeholder="host/IP">
+        <span class="cfg-label">:</span>
+        <input type="text" id="portInput" class="cfg-input" value="8880" placeholder="port">
+        <span id="connStatus"><span class="status-dot dot-red"></span> Disconnected</span>
+        <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+        <button class="btn-sm" onclick="clearLog()">Clear Log</button>
+        <span style="color:#666; margin-left:auto;" id="msgCount">0 messages</span>
+        <span style="color:#555;" id="dbStats"></span>
+    </div>
+
+    <div class="top-panels">
+        <div class="panel">
+            <h2>Latest Measurement</h2>
+            <div class="big-value" id="laeqValue">--</div>
+            <div class="big-label">LAeq (dB)</div>
+            <div style="margin-top: 10px;">
+                <div class="kv"><span class="label">LAeq Ch3</span><span class="value" id="laeqCh3">--</span></div>
+                <div class="kv"><span class="label">Device ID</span><span class="value" id="measureDevice">--</span></div>
+                <div class="kv"><span class="label">Time</span><span class="value" id="measureTime">--</span></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>State of Health</h2>
+            <div class="kv"><span class="label">Status</span><span class="value" id="sohStatus">--</span></div>
+            <div class="kv"><span class="label">Device ID</span><span class="value" id="sohDevice">--</span></div>
+            <div class="kv"><span class="label">Temperature</span><span class="value" id="sohTemp">--</span></div>
+            <div class="kv"><span class="label">CPU Usage</span><span class="value" id="sohCpu">--</span></div>
+            <div class="kv"><span class="label">RAM Usage</span><span class="value" id="sohRam">--</span></div>
+            <div class="kv"><span class="label">Disk Usage</span><span class="value" id="sohDisk">--</span></div>
+            <div class="kv"><span class="label">GPS</span><span class="value" id="sohGps">--</span></div>
+            <div class="kv"><span class="label">Uptime</span><span class="value" id="sohUptime">--</span></div>
+            <div class="kv"><span class="label">Firmware</span><span class="value" id="sohFw">--</span></div>
+            <div class="kv"><span class="label">IP Address</span><span class="value" id="sohIp">--</span></div>
+            <div class="kv"><span class="label">Last Update</span><span class="value" id="sohTime">--</span></div>
+        </div>
+    </div>
+
+    <!-- Threat Events Panel -->
+    <div class="panel threat-panel">
+        <h2>Threat Events <span class="badge" id="threatCount">0</span></h2>
+        <div class="threat-scroll">
+            <table class="threat-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Device</th>
+                        <th>Type</th>
+                        <th>Azimuth</th>
+                        <th>Elevation</th>
+                        <th>Distance</th>
+                        <th>Confidence</th>
+                    </tr>
+                </thead>
+                <tbody id="threatBody">
+                    <tr><td colspan="7" class="no-threats">No threat events yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <h2 style="font-size: 0.95rem; color: #dcdcaa; margin-bottom: 8px;">Event Log</h2>
+    <div id="log"></div>
+
+    <script>
+        let evtSource = null;
+        let msgCount = 0;
+        let threatTotal = 0;
+
+        function getApiBase() {
+            let host = document.getElementById('hostInput').value.trim() || '192.168.1.16';
+            // Strip any protocol prefix (http://, ws://, etc.)
+            host = host.replace(/^[a-z]+:\/\//i, '');
+            // Strip any trailing port (e.g. "hanna:8880" → "hanna")
+            host = host.replace(/:\d+\/?$/, '');
+            const port = document.getElementById('portInput').value.trim() || '8880';
+            return `http://${host}:${port}`;
+        }
+
+        function timestamp() { return new Date().toLocaleTimeString(); }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        function log(text, cls) {
+            const el = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + cls;
+            entry.innerHTML = `<span class="log-time">[${timestamp()}]</span>${escapeHtml(text)}`;
+            el.appendChild(entry);
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function clearLog() { document.getElementById('log').innerHTML = ''; }
+
+        // ── Threat table ──
+
+        function threatTypeClass(type) {
+            const t = (type || '').toLowerCase();
+            if (t.includes('gun')) return 'gun';
+            if (t.includes('sniper')) return 'sniper';
+            if (t.includes('firecracker')) return 'firecracker';
+            return 'other';
+        }
+
+        function addThreatRow(d, animate) {
+            const tbody = document.getElementById('threatBody');
+            // Remove "no threats" placeholder
+            if (tbody.querySelector('.no-threats')) tbody.innerHTML = '';
+
+            const tr = document.createElement('tr');
+            if (animate) tr.className = 'new-row';
+
+            const dt = d.sensor_datetime || d.datetime || d.received_at || '--';
+            const device = d.device_id || '--';
+            const type = d.threat_type || d.threat || '--';
+            const az = d.azimuth != null ? d.azimuth : (d.azimut != null ? d.azimut : '--');
+            const el = d.elevation != null ? d.elevation : '--';
+            const dist = d.distance != null ? d.distance : '--';
+            const prob = d.probability != null ? d.probability : (d.proba != null ? d.proba : '--');
+            const cls = threatTypeClass(type);
+
+            tr.innerHTML = `
+                <td>${escapeHtml(String(dt))}</td>
+                <td>${device}</td>
+                <td><span class="threat-type ${cls}">${escapeHtml(String(type))}</span></td>
+                <td>${az}&deg;</td>
+                <td>${el}&deg;</td>
+                <td>${dist} m</td>
+                <td>${prob === '--' ? '--' : (prob * 100).toFixed(0) + '%'}</td>
+            `;
+
+            // Insert at top
+            tbody.insertBefore(tr, tbody.firstChild);
+
+            threatTotal++;
+            document.getElementById('threatCount').textContent = threatTotal;
+        }
+
+        // ── Load history from API ──
+
+        async function loadHistory() {
+            try {
+                // Load recent threats
+                const API_BASE = getApiBase();
+                const threatRes = await fetch(API_BASE + '/api/threats?limit=50');
+                if (threatRes.ok) {
+                    const threats = await threatRes.json();
+                    // Reverse so oldest first (they get prepended)
+                    threats.reverse().forEach(t => addThreatRow(t, false));
+                }
+
+                // Load latest SOH
+                const sohRes = await fetch(API_BASE + '/api/soh');
+                if (sohRes.ok) {
+                    const s = await sohRes.json();
+                    if (s && s.device_id) updateSoh(s);
+                }
+
+                // Load stats
+                const statsRes = await fetch(API_BASE + '/api/stats');
+                if (statsRes.ok) {
+                    const stats = await statsRes.json();
+                    document.getElementById('dbStats').textContent =
+                        `DB: ${stats.total_measures} measures | ${stats.total_threats} threats | ${stats.total_soh} soh`;
+                }
+            } catch (e) {
+                log('Could not load history: ' + e.message, 'log-info');
+            }
+        }
+
+        // ── Update panels ──
+
+        function updateMeasure(d) {
+            const laeq = d.laeq != null ? d.laeq.toFixed(1) : '--';
+            const ch3 = d.laeq_chan3 != null ? d.laeq_chan3.toFixed(1) : '--';
+            document.getElementById('laeqValue').textContent = laeq;
+            document.getElementById('laeqCh3').textContent = ch3 + ' dB';
+            document.getElementById('measureDevice').textContent = d.device_id || '--';
+            document.getElementById('measureTime').textContent = d.datetime || '--';
+        }
+
+        function updateSoh(d) {
+            document.getElementById('sohStatus').textContent = d.status || '--';
+            document.getElementById('sohDevice').textContent = d.device_id || '--';
+            document.getElementById('sohTemp').textContent = (d.temp || '--') + '\u00B0F';
+            document.getElementById('sohCpu').textContent = (d.cpu_usage != null ? Number(d.cpu_usage).toFixed(1) : (d.CPU_usage != null ? d.CPU_usage.toFixed(1) : '--')) + '%';
+            document.getElementById('sohRam').textContent = (d.ram_usage != null ? Number(d.ram_usage).toFixed(1) : (d.RAM_usage != null ? d.RAM_usage.toFixed(1) : '--')) + '%';
+            document.getElementById('sohDisk').textContent = (d.disk_usage != null ? Number(d.disk_usage).toFixed(1) : '--') + '%';
+            const lat = d.latitude || d.Pod_latitude || '--';
+            const lon = d.longitude || d.Pod_longitude || '--';
+            document.getElementById('sohGps').textContent = lat + ', ' + lon;
+            const uptime = d.uptime != null ? (Number(d.uptime) / 60).toFixed(1) + ' hrs' : '--';
+            document.getElementById('sohUptime').textContent = uptime;
+            document.getElementById('sohFw').textContent = d.fw_version || '--';
+            document.getElementById('sohIp').textContent = d.ip || '--';
+            document.getElementById('sohTime').textContent = d.sensor_datetime || d.datetime || '--';
+        }
+
+        // ── SSE Connection ──
+
+        function toggleConnection() {
+            if (evtSource) {
+                evtSource.close(); evtSource = null;
+                document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-red"></span> Disconnected';
+                document.getElementById('connectBtn').textContent = 'Connect';
+                document.getElementById('connectBtn').classList.remove('connected');
+                log('Disconnected', 'log-info');
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const API_BASE = getApiBase();
+            const url = API_BASE + '/events';
+            log('Connecting to ' + url + ' ...', 'log-info');
+
+            evtSource = new EventSource(url);
+
+            evtSource.onopen = () => {
+                log('Connected to event stream', 'log-info');
+                document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-green"></span> Connected';
+                document.getElementById('connectBtn').textContent = 'Disconnect';
+                document.getElementById('connectBtn').classList.add('connected');
+            };
+
+            evtSource.onmessage = (e) => {
+                msgCount++;
+                document.getElementById('msgCount').textContent = msgCount + ' messages';
+
+                let msg;
+                try { msg = JSON.parse(e.data); } catch (err) { return; }
+                const d = msg.data || {};
+
+                if (msg.type === 'measure') {
+                    updateMeasure(d);
+                    log(`[MEASURE] Device ${d.device_id} | LAeq: ${d.laeq?.toFixed(1)} dB`, 'log-measure');
+
+                } else if (msg.type === 'soh') {
+                    updateSoh(d);
+                    log(`[SOH] Device ${d.device_id} | ${d.status} | Temp: ${d.temp}\u00B0F`, 'log-soh');
+
+                } else if (msg.type === 'threat') {
+                    addThreatRow(d, true);
+                    const ttype = d.threat || 'unknown';
+                    log(`[THREAT] Device ${d.device_id} | ${ttype} | Az: ${d.azimut}\u00B0 El: ${d.elevation}\u00B0 Dist: ${d.distance}m`, 'log-threat');
+
+                } else {
+                    log(`[${msg.type}] ${JSON.stringify(d)}`, 'log-info');
+                }
+            };
+
+            evtSource.onerror = () => {
+                log('Connection lost \u2014 retrying...', 'log-info');
+                document.getElementById('connStatus').innerHTML = '<span class="status-dot dot-yellow"></span> Reconnecting...';
+            };
+        }
+
+        // ── Init ──
+        loadHistory();
+        connect();
+    </script>
+</body>
+</html>

@@ -132,3 +132,7 @@ Alternatively you can put it in test mode or generate real gunshot events.
 ## License
 
 See individual dependency licenses in `vendor/`.
+
+---
+
+*Acoem, Cadence, and ATD-300 are property or registered trademarks of Acoem. This project is not affiliated with or endorsed by Acoem.*

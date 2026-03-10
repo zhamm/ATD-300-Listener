@@ -4,6 +4,7 @@ require __DIR__ . '/vendor/autoload.php';
 $port = 8880;
 $dbDir = __DIR__ . '/db';
 
+
 // ── Create db directory ───────────────────────────────────────────────
 
 if (!is_dir($dbDir)) {
@@ -114,6 +115,7 @@ $stmtThreat = safePrepare($db, 'threats',
 
 $lastSensorLat = 0.0;
 $lastSensorLon = 0.0;
+$lastSensorOrientation = 0.0;  // pod-reported north orientation (from SOH)
 
 // ── Geodesic destination point ────────────────────────────────────────
 // Given origin (lat, lon in degrees), bearing (degrees from north), distance (meters)
@@ -202,23 +204,34 @@ function storeSoh($json) {
         $lastSensorLat = (float)$lat;
         $lastSensorLon = (float)$lon;
     }
+    // Cache pod orientation if reported
+    if (isset($json['orientation']) && $json['orientation'] != 0) {
+        $lastSensorOrientation = (float)$json['orientation'];
+    }
 }
 
 function storeThreat($json) {
-    global $stmtThreat, $lastSensorLat, $lastSensorLon;
+    global $stmtThreat, $lastSensorLat, $lastSensorLon, $lastSensorOrientation;
 
     $az   = (float)($json['azimut'] ?? 0);
     $dist = (float)($json['distance'] ?? 0);
     $eventLat = null;
     $eventLon = null;
 
-    // Compute event GPS from sensor position + azimuth + distance
+    // Apply north orientation correction from SOH
+    $orientOffset = $lastSensorOrientation;
+    $trueBearing = fmod($az + $orientOffset + 360, 360);
+
+    // Compute event GPS from sensor position + corrected bearing + distance
     if ($lastSensorLat != 0 && $lastSensorLon != 0 && $dist > 0) {
-        [$eventLat, $eventLon] = destinationPoint($lastSensorLat, $lastSensorLon, $az, $dist);
+        [$eventLat, $eventLon] = destinationPoint($lastSensorLat, $lastSensorLon, $trueBearing, $dist);
         // Inject into the JSON so the broadcast includes it
         $json['event_latitude']  = round($eventLat, 6);
         $json['event_longitude'] = round($eventLon, 6);
     }
+    // Include corrected bearing in broadcast
+    $json['true_bearing'] = round($trueBearing, 2);
+    $json['north_orientation'] = round($orientOffset, 2);
 
     $stmtThreat->bindValue(':did',  $json['device_id'] ?? 0, SQLITE3_INTEGER);
     $stmtThreat->bindValue(':type', $json['threat'] ?? '', SQLITE3_TEXT);

@@ -114,6 +114,7 @@
             <div class="kv"><span class="label">Uptime</span><span class="value" id="sohUptime">--</span></div>
             <div class="kv"><span class="label">Firmware</span><span class="value" id="sohFw">--</span></div>
             <div class="kv"><span class="label">IP Address</span><span class="value" id="sohIp">--</span></div>
+            <div class="kv"><span class="label">North Orientation</span><span class="value" id="sohOrientation">--</span></div>
             <div class="kv"><span class="label">Last Update</span><span class="value" id="sohTime">--</span></div>
         </div>
     </div>
@@ -171,6 +172,7 @@
         let gmapsReady = false;
         let configLoaded = false;
         let mapApiKey = '';
+        let northOrientation = 0;  // degrees offset from SOH orientation field
 
         // ── Load config.json ──
         async function loadConfig() {
@@ -291,8 +293,12 @@
         function addThreatMarker(azimuth, elevation, distance, threatType, datetime) {
             if (sensorLat == null || sensorLon == null) return null;
 
-            const az = Number(azimuth);
-            if (isNaN(az)) return null;
+            const rawAz = Number(azimuth);
+            if (isNaN(rawAz)) return null;
+
+            // Apply north orientation correction: pod azimuth is relative to its
+            // own north; offset converts to true north bearing
+            const az = (rawAz + northOrientation + 360) % 360;
 
             const dist = Number(distance);
             const hasDistance = !isNaN(dist) && dist > 0;
@@ -565,7 +571,14 @@
             document.getElementById('sohUptime').textContent = uptime;
             document.getElementById('sohFw').textContent = d.fw_version || '--';
             document.getElementById('sohIp').textContent = d.ip || '--';
+            const orient = d.orientation != null ? Number(d.orientation) : null;
+            document.getElementById('sohOrientation').textContent = orient != null ? orient.toFixed(1) + '\u00B0' : '--';
             document.getElementById('sohTime').textContent = d.sensor_datetime || d.datetime || '--';
+
+            // Update north orientation for map bearing correction
+            if (orient != null && orient !== 0) {
+                northOrientation = orient;
+            }
 
             // Update sensor position for map
             sensorDeviceId = d.device_id || sensorDeviceId;

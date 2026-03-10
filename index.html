@@ -40,8 +40,9 @@
         .threat-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
         .threat-table th { text-align: left; color: #9cdcfe; padding: 6px 8px; border-bottom: 2px solid #444; font-weight: normal; }
         .threat-table td { padding: 5px 8px; border-bottom: 1px solid #2a2a2a; }
-        .threat-table tbody tr { transition: background 0.2s; }
+        .threat-table tbody tr { transition: background 0.2s; cursor: pointer; }
         .threat-table tbody tr:hover { background: #2a2d2e; }
+        .threat-table tbody tr.selected-row { background: #2a3a4a; }
         .threat-table tbody tr.new-row { animation: flashRow 2s ease-out; }
         @keyframes flashRow { 0% { background: #5c2020; } 100% { background: transparent; } }
         .threat-type { font-weight: bold; text-transform: uppercase; }
@@ -51,6 +52,15 @@
         .threat-type.other { color: #ce9178; }
         .threat-scroll { max-height: 220px; overflow-y: auto; }
         .no-threats { color: #555; text-align: center; padding: 20px; font-style: italic; }
+
+        /* Map panel */
+        .map-panel { margin-bottom: 16px; }
+        #map { width: 100%; height: 350px; border-radius: 4px; background: #111; border: 1px solid #333; }
+        .map-legend { display: flex; gap: 16px; margin-top: 8px; font-size: 0.8rem; color: #888; align-items: center; }
+        .legend-dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+        .legend-blue { background: #4285F4; }
+        .legend-red { background: #f44747; }
+        .legend-line { width: 20px; height: 3px; background: #ffb74d; display: inline-block; margin-right: 4px; vertical-align: middle; }
 
         /* Event log */
         #log { background: #111; border: 1px solid #333; border-radius: 4px; padding: 12px; height: 200px; overflow-y: auto; font-size: 0.8rem; line-height: 1.5; }
@@ -131,6 +141,18 @@
         </div>
     </div>
 
+    <!-- Map Panel -->
+    <div class="panel map-panel">
+        <h2>Event Map <button class="btn-sm" onclick="clearMapEvents()" style="margin-left:auto;">Clear Map</button></h2>
+        <div id="map"></div>
+        <div class="map-legend">
+            <span><span class="legend-dot legend-blue"></span> Sensor (ATD-300)</span>
+            <span><span class="legend-dot legend-red"></span> Gunshot Event (with distance)</span>
+            <span><span class="legend-line"></span> Azimuth only (no distance)</span>
+            <span id="mapStatus" style="margin-left:auto;">Loading map&hellip;</span>
+        </div>
+    </div>
+
     <h2 style="font-size: 0.95rem; color: #dcdcaa; margin-bottom: 8px;">Event Log</h2>
     <div id="log"></div>
 
@@ -138,6 +160,266 @@
         let evtSource = null;
         let msgCount = 0;
         let threatTotal = 0;
+
+        // ── Map state ──
+        let gmap = null;
+        let sensorMarker = null;
+        let sensorLat = null;
+        let sensorLon = null;
+        let sensorDeviceId = null;
+        let threatMarkers = [];   // markers + polylines for cleanup
+        let gmapsReady = false;
+        let configLoaded = false;
+        let mapApiKey = '';
+
+        // ── Load config.json ──
+        async function loadConfig() {
+            try {
+                const res = await fetch('config.json');
+                if (res.ok) {
+                    const cfg = await res.json();
+                    mapApiKey = cfg.google_maps_api_key || '';
+                }
+            } catch (e) {
+                console.warn('Could not load config.json:', e.message);
+            }
+            configLoaded = true;
+            if (mapApiKey && mapApiKey !== 'YOUR_API_KEY_HERE') {
+                loadGoogleMaps(mapApiKey);
+            } else {
+                document.getElementById('mapStatus').textContent = 'No API key — set google_maps_api_key in config.json';
+            }
+        }
+
+        // ── Load Google Maps API dynamically ──
+        function loadGoogleMaps(apiKey) {
+            const script = document.createElement('script');
+            script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&callback=initMap`;
+            script.async = true;
+            script.defer = true;
+            script.onerror = () => {
+                document.getElementById('mapStatus').textContent = 'Failed to load Google Maps API';
+            };
+            document.head.appendChild(script);
+        }
+
+        // ── Google Maps callback ──
+        function initMap() {
+            gmapsReady = true;
+            gmap = new google.maps.Map(document.getElementById('map'), {
+                zoom: 15,
+                center: { lat: 0, lng: 0 },
+                mapTypeId: 'hybrid',
+                styles: [{ featureType: 'all', elementType: 'labels', stylers: [{ visibility: 'on' }] }]
+            });
+            document.getElementById('mapStatus').textContent = 'Map ready';
+
+            // If we already have sensor position, place it
+            if (sensorLat != null && sensorLon != null) {
+                updateSensorMarker(sensorLat, sensorLon);
+            }
+        }
+        // Expose callback globally for the Google Maps script
+        window.initMap = initMap;
+
+        // ── Geodesic destination point ──
+        // Given origin (lat, lon in degrees), bearing (degrees from north), distance (meters)
+        // Returns { lat, lng } in degrees
+        function destinationPoint(lat1Deg, lon1Deg, bearingDeg, distanceM) {
+            const R = 6371000; // Earth radius in meters
+            const toRad = Math.PI / 180;
+            const toDeg = 180 / Math.PI;
+            const lat1 = lat1Deg * toRad;
+            const lon1 = lon1Deg * toRad;
+            const brng = bearingDeg * toRad;
+            const d = distanceM / R;
+
+            const lat2 = Math.asin(
+                Math.sin(lat1) * Math.cos(d) +
+                Math.cos(lat1) * Math.sin(d) * Math.cos(brng)
+            );
+            const lon2 = lon1 + Math.atan2(
+                Math.sin(brng) * Math.sin(d) * Math.cos(lat1),
+                Math.cos(d) - Math.sin(lat1) * Math.sin(lat2)
+            );
+            return { lat: lat2 * toDeg, lng: lon2 * toDeg };
+        }
+
+        // ── Update sensor marker (blue) with label ──
+        let sensorInfoWindow = null;
+        function updateSensorMarker(lat, lon) {
+            if (!gmapsReady || !gmap) return;
+            const pos = { lat: Number(lat), lng: Number(lon) };
+            const label = sensorDeviceId ? `Sensor Pod #${sensorDeviceId}` : 'ATD-300 Sensor Pod';
+            if (sensorMarker) {
+                sensorMarker.setPosition(pos);
+                sensorMarker.setTitle(label);
+                sensorMarker.setLabel({ text: label, color: '#fff', fontSize: '11px', fontWeight: 'bold', className: 'sensor-label' });
+                if (sensorInfoWindow) {
+                    sensorInfoWindow.setContent(`<div style="color:#333;"><strong>${label}</strong><br>${lat.toFixed(6)}, ${lon.toFixed(6)}</div>`);
+                }
+            } else {
+                sensorMarker = new google.maps.Marker({
+                    position: pos,
+                    map: gmap,
+                    title: label,
+                    label: { text: label, color: '#fff', fontSize: '11px', fontWeight: 'bold', className: 'sensor-label' },
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        scale: 10,
+                        fillColor: '#4285F4',
+                        fillOpacity: 1,
+                        strokeColor: '#fff',
+                        strokeWeight: 2,
+                        labelOrigin: new google.maps.Point(0, -18)
+                    },
+                    zIndex: 10
+                });
+                sensorInfoWindow = new google.maps.InfoWindow({
+                    content: `<div style="color:#333;"><strong>${label}</strong><br>${lat.toFixed(6)}, ${lon.toFixed(6)}</div>`
+                });
+                sensorMarker.addListener('click', () => sensorInfoWindow.open(gmap, sensorMarker));
+            }
+            // Center map on sensor if no threat markers yet
+            if (threatMarkers.length === 0) {
+                gmap.setCenter(pos);
+            }
+        }
+
+        // ── Add threat to the map ──
+        // Returns { lat, lng } of event if distance is known, or null for azimuth-only
+        function addThreatMarker(azimuth, elevation, distance, threatType, datetime) {
+            if (sensorLat == null || sensorLon == null) return null;
+
+            const az = Number(azimuth);
+            if (isNaN(az)) return null;
+
+            const dist = Number(distance);
+            const hasDistance = !isNaN(dist) && dist > 0;
+
+            if (hasDistance) {
+                // ── Known distance: place a red marker at the computed event location ──
+                const eventPos = destinationPoint(sensorLat, sensorLon, az, dist);
+
+                if (gmapsReady && gmap) {
+                    const marker = new google.maps.Marker({
+                        position: eventPos,
+                        map: gmap,
+                        title: `${threatType || 'Threat'} \u2014 ${datetime || ''}`,
+                        icon: {
+                            url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(
+                                '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24">'
+                                + '<circle cx="12" cy="12" r="11" fill="%23f44747" stroke="white" stroke-width="2"/>'
+                                + '<text x="12" y="16" text-anchor="middle" font-size="12" fill="white">&#x1F52B;</text>'
+                                + '</svg>'
+                            ),
+                            scaledSize: new google.maps.Size(28, 28),
+                            anchor: new google.maps.Point(14, 14)
+                        },
+                        zIndex: 20
+                    });
+
+                    const infoWindow = new google.maps.InfoWindow({
+                        content: `<div style="color:#333;"><strong>${escapeHtml(String(threatType || 'Threat'))}</strong><br>`
+                               + `Az: ${az}&deg; | Dist: ${dist}m<br>`
+                               + `Location: ${eventPos.lat.toFixed(6)}, ${eventPos.lng.toFixed(6)}<br>`
+                               + `${escapeHtml(String(datetime || ''))}</div>`
+                    });
+                    marker.addListener('click', () => infoWindow.open(gmap, marker));
+
+                    // Dashed orange line connecting sensor to event
+                    const connector = new google.maps.Polyline({
+                        path: [
+                            { lat: sensorLat, lng: sensorLon },
+                            eventPos
+                        ],
+                        geodesic: true,
+                        strokeColor: '#ffb74d',
+                        strokeOpacity: 0,
+                        icons: [{
+                            icon: { path: 'M 0,-1 0,1', strokeOpacity: 0.9, strokeColor: '#ffb74d', strokeWeight: 3, scale: 3 },
+                            offset: '0',
+                            repeat: '14px'
+                        }],
+                        map: gmap
+                    });
+
+                    threatMarkers.push(marker);
+                    threatMarkers.push(connector);
+                    fitMapBounds();
+                }
+
+                return eventPos;
+
+            } else {
+                // ── Azimuth only: draw a directional arrow from the sensor ──
+                const ARROW_LENGTH_M = 300; // visual arrow length in meters
+                const endPos = destinationPoint(sensorLat, sensorLon, az, ARROW_LENGTH_M);
+
+                if (gmapsReady && gmap) {
+                    const line = new google.maps.Polyline({
+                        path: [
+                            { lat: sensorLat, lng: sensorLon },
+                            endPos
+                        ],
+                        geodesic: true,
+                        strokeColor: '#ffb74d',
+                        strokeOpacity: 0.9,
+                        strokeWeight: 3,
+                        icons: [{
+                            icon: { path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 4, fillColor: '#ffb74d', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 1 },
+                            offset: '100%'
+                        }],
+                        map: gmap
+                    });
+
+                    // Attach info window to the arrow endpoint
+                    const infoWindow = new google.maps.InfoWindow({
+                        content: `<div style="color:#333;"><strong>${escapeHtml(String(threatType || 'Threat'))}</strong><br>`
+                               + `Az: ${az}&deg; (direction only \u2014 no distance)<br>`
+                               + `${escapeHtml(String(datetime || ''))}</div>`,
+                        position: endPos
+                    });
+                    line.addListener('click', () => infoWindow.open(gmap));
+
+                    // Store polyline so fitMapBounds can include it
+                    line._endPos = endPos;
+                    threatMarkers.push(line);
+                    fitMapBounds();
+                }
+
+                return null; // no precise event location
+            }
+        }
+
+        // ── Fit map bounds to show sensor + all threat markers/arrows ──
+        function fitMapBounds() {
+            if (!gmapsReady || !gmap) return;
+            const bounds = new google.maps.LatLngBounds();
+            bounds.extend({ lat: sensorLat, lng: sensorLon });
+            threatMarkers.forEach(item => {
+                if (item.getPosition) {
+                    bounds.extend(item.getPosition()); // Marker
+                } else if (item._endPos) {
+                    bounds.extend(item._endPos);        // Polyline arrow
+                }
+            });
+            gmap.fitBounds(bounds);
+            if (gmap.getZoom() > 18) gmap.setZoom(18);
+        }
+
+        // ── Clear all threat markers / arrows from the map ──
+        function clearMapEvents() {
+            threatMarkers.forEach(item => {
+                if (item.setMap) item.setMap(null); // Marker or Polyline
+            });
+            threatMarkers = [];
+            // Re-center on sensor
+            if (gmapsReady && gmap && sensorLat != null && sensorLon != null) {
+                gmap.setCenter({ lat: sensorLat, lng: sensorLon });
+                gmap.setZoom(16);
+            }
+        }
 
         function getApiBase() {
             let host = document.getElementById('hostInput').value.trim() || '192.168.1.16';
@@ -192,6 +474,22 @@
             const dist = d.distance != null ? d.distance : '--';
             const prob = d.probability != null ? d.probability : (d.proba != null ? d.proba : '--');
             const cls = threatTypeClass(type);
+
+            // Plot on embedded map
+            addThreatMarker(az, el, dist, type, dt);
+
+            // Store data on row so clicking can re-plot after clear
+            tr._threatData = { az, el, dist, type, dt };
+            tr.title = 'Click to show on map';
+            tr.addEventListener('click', function () {
+                // Highlight selected row
+                document.querySelectorAll('#threatBody tr.selected-row').forEach(r => r.classList.remove('selected-row'));
+                this.classList.add('selected-row');
+                // Re-plot just this event (clear existing threat markers first)
+                clearMapEvents();
+                const td = this._threatData;
+                addThreatMarker(td.az, td.el, td.dist, td.type, td.dt);
+            });
 
             tr.innerHTML = `
                 <td>${escapeHtml(String(dt))}</td>
@@ -260,14 +558,24 @@
             document.getElementById('sohCpu').textContent = (d.cpu_usage != null ? Number(d.cpu_usage).toFixed(1) : (d.CPU_usage != null ? d.CPU_usage.toFixed(1) : '--')) + '%';
             document.getElementById('sohRam').textContent = (d.ram_usage != null ? Number(d.ram_usage).toFixed(1) : (d.RAM_usage != null ? d.RAM_usage.toFixed(1) : '--')) + '%';
             document.getElementById('sohDisk').textContent = (d.disk_usage != null ? Number(d.disk_usage).toFixed(1) : '--') + '%';
-            const lat = d.latitude || d.Pod_latitude || '--';
-            const lon = d.longitude || d.Pod_longitude || '--';
-            document.getElementById('sohGps').textContent = lat + ', ' + lon;
+            const lat = d.latitude || d.Pod_latitude || null;
+            const lon = d.longitude || d.Pod_longitude || null;
+            document.getElementById('sohGps').textContent = (lat || '--') + ', ' + (lon || '--');
             const uptime = d.uptime != null ? (Number(d.uptime) / 60).toFixed(1) + ' hrs' : '--';
             document.getElementById('sohUptime').textContent = uptime;
             document.getElementById('sohFw').textContent = d.fw_version || '--';
             document.getElementById('sohIp').textContent = d.ip || '--';
             document.getElementById('sohTime').textContent = d.sensor_datetime || d.datetime || '--';
+
+            // Update sensor position for map
+            sensorDeviceId = d.device_id || sensorDeviceId;
+            if (lat != null && lon != null && lat !== '--' && lon !== '--') {
+                sensorLat = Number(lat);
+                sensorLon = Number(lon);
+                if (!isNaN(sensorLat) && !isNaN(sensorLon) && sensorLat !== 0 && sensorLon !== 0) {
+                    updateSensorMarker(sensorLat, sensorLon);
+                }
+            }
         }
 
         // ── SSE Connection ──
@@ -331,6 +639,7 @@
         }
 
         // ── Init ──
+        loadConfig();   // loads API key then inits Google Map
         loadHistory();
         connect();
     </script>

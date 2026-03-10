@@ -53,6 +53,8 @@ $db->exec('CREATE TABLE IF NOT EXISTS threats (
     azimuth REAL,
     elevation REAL,
     distance REAL,
+    event_latitude REAL,
+    event_longitude REAL,
     fw_version TEXT,
     nn_version TEXT,
     sensor_datetime TEXT,
@@ -66,7 +68,7 @@ echo "[DB] SQLite database ready at db/atd300.sqlite3\n";
 
 $sqlMeasure = 'INSERT INTO measures (device_id, laeq, laeq_chan3, sensor_datetime, received_at, raw_json) VALUES (:did, :laeq, :ch3, :sdt, :rat, :raw)';
 $sqlSoh     = 'INSERT INTO soh (device_id, status, temp, cpu_usage, ram_usage, disk_usage, latitude, longitude, uptime, fw_version, ip, orientation, sensor_datetime, received_at, raw_json) VALUES (:did, :status, :temp, :cpu, :ram, :disk, :lat, :lon, :uptime, :fw, :ip, :orient, :sdt, :rat, :raw)';
-$sqlThreat  = 'INSERT INTO threats (device_id, threat_type, probability, azimuth, elevation, distance, fw_version, nn_version, sensor_datetime, received_at, raw_json) VALUES (:did, :type, :prob, :az, :el, :dist, :fw, :nn, :sdt, :rat, :raw)';
+$sqlThreat  = 'INSERT INTO threats (device_id, threat_type, probability, azimuth, elevation, distance, event_latitude, event_longitude, fw_version, nn_version, sensor_datetime, received_at, raw_json) VALUES (:did, :type, :prob, :az, :el, :dist, :elat, :elon, :fw, :nn, :sdt, :rat, :raw)';
 
 // Try to prepare; if schema is outdated, drop and recreate the table
 function safePrepare($db, $table, $createSql, $insertSql) {
@@ -103,9 +105,36 @@ $stmtThreat = safePrepare($db, 'threats',
     'CREATE TABLE IF NOT EXISTS threats (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         device_id INTEGER, threat_type TEXT, probability REAL, azimuth REAL,
-        elevation REAL, distance REAL, fw_version TEXT, nn_version TEXT,
+        elevation REAL, distance REAL, event_latitude REAL, event_longitude REAL,
+        fw_version TEXT, nn_version TEXT,
         sensor_datetime TEXT, received_at TEXT, raw_json TEXT
     )', $sqlThreat);
+
+// ── Last known sensor position (from SOH) for event GPS computation ──
+
+$lastSensorLat = 0.0;
+$lastSensorLon = 0.0;
+
+// ── Geodesic destination point ────────────────────────────────────────
+// Given origin (lat, lon in degrees), bearing (degrees from north), distance (meters)
+// Returns [lat, lon] in degrees
+function destinationPoint($lat1Deg, $lon1Deg, $bearingDeg, $distanceM) {
+    $R = 6371000; // Earth radius in meters
+    $lat1 = deg2rad($lat1Deg);
+    $lon1 = deg2rad($lon1Deg);
+    $brng = deg2rad($bearingDeg);
+    $d = $distanceM / $R;
+
+    $lat2 = asin(
+        sin($lat1) * cos($d) +
+        cos($lat1) * sin($d) * cos($brng)
+    );
+    $lon2 = $lon1 + atan2(
+        sin($brng) * sin($d) * cos($lat1),
+        cos($d) - sin($lat1) * sin($lat2)
+    );
+    return [rad2deg($lat2), rad2deg($lon2)];
+}
 
 // ── SSE clients ───────────────────────────────────────────────────────
 
@@ -147,7 +176,7 @@ function storeMeasure($json) {
 }
 
 function storeSoh($json) {
-    global $stmtSoh;
+    global $stmtSoh, $lastSensorLat, $lastSensorLon;
     $stmtSoh->bindValue(':did',    $json['device_id'] ?? 0, SQLITE3_INTEGER);
     $stmtSoh->bindValue(':status', $json['status'] ?? '', SQLITE3_TEXT);
     $stmtSoh->bindValue(':temp',   $json['temp'] ?? '', SQLITE3_TEXT);
@@ -165,16 +194,40 @@ function storeSoh($json) {
     $stmtSoh->bindValue(':raw',    json_encode($json), SQLITE3_TEXT);
     $stmtSoh->execute();
     $stmtSoh->reset();
+
+    // Cache latest sensor GPS for event computation
+    $lat = $json['Pod_latitude'] ?? 0;
+    $lon = $json['Pod_longitude'] ?? 0;
+    if ($lat != 0 && $lon != 0) {
+        $lastSensorLat = (float)$lat;
+        $lastSensorLon = (float)$lon;
+    }
 }
 
 function storeThreat($json) {
-    global $stmtThreat;
+    global $stmtThreat, $lastSensorLat, $lastSensorLon;
+
+    $az   = (float)($json['azimut'] ?? 0);
+    $dist = (float)($json['distance'] ?? 0);
+    $eventLat = null;
+    $eventLon = null;
+
+    // Compute event GPS from sensor position + azimuth + distance
+    if ($lastSensorLat != 0 && $lastSensorLon != 0 && $dist > 0) {
+        [$eventLat, $eventLon] = destinationPoint($lastSensorLat, $lastSensorLon, $az, $dist);
+        // Inject into the JSON so the broadcast includes it
+        $json['event_latitude']  = round($eventLat, 6);
+        $json['event_longitude'] = round($eventLon, 6);
+    }
+
     $stmtThreat->bindValue(':did',  $json['device_id'] ?? 0, SQLITE3_INTEGER);
     $stmtThreat->bindValue(':type', $json['threat'] ?? '', SQLITE3_TEXT);
     $stmtThreat->bindValue(':prob', $json['proba'] ?? 0, SQLITE3_FLOAT);
-    $stmtThreat->bindValue(':az',   $json['azimut'] ?? 0, SQLITE3_FLOAT);
+    $stmtThreat->bindValue(':az',   $az, SQLITE3_FLOAT);
     $stmtThreat->bindValue(':el',   $json['elevation'] ?? 0, SQLITE3_FLOAT);
-    $stmtThreat->bindValue(':dist', $json['distance'] ?? 0, SQLITE3_FLOAT);
+    $stmtThreat->bindValue(':dist', $dist, SQLITE3_FLOAT);
+    $stmtThreat->bindValue(':elat', $eventLat, $eventLat !== null ? SQLITE3_FLOAT : SQLITE3_NULL);
+    $stmtThreat->bindValue(':elon', $eventLon, $eventLon !== null ? SQLITE3_FLOAT : SQLITE3_NULL);
     $stmtThreat->bindValue(':fw',   $json['fw_version'] ?? '', SQLITE3_TEXT);
     $stmtThreat->bindValue(':nn',   $json['nn_version'] ?? '', SQLITE3_TEXT);
     $stmtThreat->bindValue(':sdt',  $json['datetime'] ?? '', SQLITE3_TEXT);
@@ -182,6 +235,8 @@ function storeThreat($json) {
     $stmtThreat->bindValue(':raw',  json_encode($json), SQLITE3_TEXT);
     $stmtThreat->execute();
     $stmtThreat->reset();
+
+    return $json; // return enriched JSON with event GPS
 }
 
 // ── JSON API response helper ──────────────────────────────────────────
@@ -310,7 +365,7 @@ function processRequest($conn, $headerBlock, $body) {
             $el = $json['elevation'] ?? '?';
             $dist = $json['distance'] ?? '?';
             echo "  └─ [THREAT] Device {$deviceId} | {$threat} | Az: {$az}° El: {$el}° Dist: {$dist}m\n";
-            storeThreat($json);
+            $json = storeThreat($json);
         } else {
             echo "  └─ [{$type}] {$body}\n";
         }
